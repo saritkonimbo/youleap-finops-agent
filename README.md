@@ -123,7 +123,11 @@ Repository scaffold: ready.
 
 Slack transport: scaffolded.
 
-Umbrella adapter: boundary ready; authentication/query implementation pending account connection.
+Umbrella MCP transport and standalone OAuth connection command: implemented.
+User authorization, authenticated schema discovery and financial response mapping: pending.
+
+See [Umbrella connection instructions](docs/umbrella-connection.md).
+Run `npm run umbrella:connect` on the runtime host; Slack credentials are not required.
 
 Natural-language intent/LLM layer: intentionally pending until the data connection is verified, so the agent cannot fabricate financial results.
 
