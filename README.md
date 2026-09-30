@@ -2,6 +2,18 @@
 
 Internal FinOps copilot that lets authorized users ask cloud-cost questions from Slack and receive answers backed by Umbrella Cost.
 
+## Current cloud route: n8n → Claude Routine
+
+For the user's cloud-only setup, the importable workflow in
+[integrations/n8n](integrations/n8n/README-he.md) forwards a new private Slack
+message to the existing Claude Routine's API trigger. Claude uses its connected
+Umbrella and Slack MCPs and answers in the source thread. The standalone Node
+bot below is an alternative scaffold, not the runtime used by this route.
+
+The workflow includes durable PostgreSQL dispatch deduplication, an updated
+routine prompt, a Slack app manifest, setup instructions, and tested filters.
+It has not been installed or verified end-to-end on the user's n8n instance.
+
 ## Goal
 
 Slack question → controlled FinOps tool → Umbrella Cost → analysis → Slack thread response.

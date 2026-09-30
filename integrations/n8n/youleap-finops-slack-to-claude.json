@@ -1,0 +1,256 @@
+{
+  "name": "YouLeap FinOps — Slack to Claude Routine",
+  "nodes": [
+    {
+      "id": "slack-message",
+      "name": "Slack message",
+      "type": "n8n-nodes-base.slackTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "trigger": [
+          "message"
+        ],
+        "watchWorkspace": false,
+        "channelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "C0C5HBL3USJ"
+        },
+        "options": {
+          "resolveIds": false
+        }
+      },
+      "webhookId": "6f966fd6-117b-4398-a382-7a29c3e1b7c9"
+    },
+    {
+      "id": "filter-human-messages",
+      "name": "Filter human messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Embedded into the workflow Code node by build-workflow.py.\n// Slack Trigger emits the event itself, without the Events API envelope.\nconst allowedChannel = 'C0C5HBL3USJ';\nconst allowedUsers = new Set(['U9MGNGP4G', 'U0AT5PLUS5R', 'U0KABL7ML']);\nconst items = [];\nfor (const [index, item] of $input.all().entries()) {\n  const event = item.json.event || item.json;\n  if (event.type !== 'message' || event.channel !== allowedChannel) continue;\n  if (event.bot_id || event.app_id || event.hidden) continue;\n  if (event.subtype && event.subtype !== 'file_share') continue;\n  if (!allowedUsers.has(event.user)) continue;\n  const text = typeof event.text === 'string' ? event.text.trim() : '';\n  if (!text || text.includes('YouLeap FinOps (אוטומטי)')) continue;\n  if (!/^\\d+\\.\\d+$/.test(event.ts || '')) continue;\n  const threadTs = event.thread_ts || event.ts;\n  if (!/^\\d+\\.\\d+$/.test(threadTs)) continue;\n  const context = {\n    source: 'youleap-finops-slack',\n    channel_id: allowedChannel,\n    message_ts: event.ts,\n    thread_ts: threadTs,\n    user_id: event.user,\n    event_key: allowedChannel + ':' + event.ts,\n    // The routine reads the authoritative message via Slack; no text is\n    // trusted as system instructions or needed in the trigger body.\n    message_url: 'https://konimbok.slack.com/archives/' + allowedChannel +\n      '/p' + event.ts.replace('.', ''),\n  };\n  items.push({\n    json: { ...context, payload: { text: JSON.stringify(context) } },\n    pairedItem: { item: index },\n  });\n}\nreturn items;\n"
+      }
+    },
+    {
+      "id": "claim-message",
+      "name": "Claim message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO youleap_finops.slack_dispatch\n  (event_key, channel_id, message_ts, thread_ts, user_id)\nVALUES ($1, $2, $3, $4, $5)\nON CONFLICT (event_key) DO NOTHING\nRETURNING event_key, $6::jsonb AS payload;",
+        "options": {
+          "queryReplacement": "={{ [$json.event_key, $json.channel_id, $json.message_ts, $json.thread_ts, $json.user_id, JSON.stringify($json.payload)] }}"
+        }
+      },
+      "alwaysOutputData": false
+    },
+    {
+      "id": "fire-claude-routine",
+      "name": "Fire Claude routine",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/claude_code/routines/trig_01AzDhXfxgA6VciGcWeLWSoc/fire",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-beta",
+              "value": "experimental-cc-routine-2026-04-01"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "timeout": 30000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text",
+              "outputPropertyName": "body"
+            }
+          }
+        }
+      },
+      "retryOnFail": false,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "classify-api-response",
+      "name": "Classify API response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const original = $('Claim message').first().json;\nreturn $input.all().map((item, index) => {\n  const result = item.json;\n  const code = Number(result.statusCode || 0);\n  let body = result.body;\n  if (typeof body === 'string') {\n    try { body = JSON.parse(body); } catch { body = {}; }\n  }\n  const accepted = code >= 200 && code < 300 && body?.type === 'routine_fire' &&\n    typeof body.claude_code_session_id === 'string' && body.claude_code_session_id.startsWith('session_');\n  // A timeout or server error may occur AFTER the routine started.\n  // Do not repeat an ambiguous POST automatically.\n  const status = accepted ? 'accepted' : code >= 400 && code < 500 ? 'rejected' : 'uncertain';\n  return {\n    json: {\n      event_key: original.event_key,\n      status,\n      http_status: code || null,\n      session_id: accepted ? body.claude_code_session_id : null,\n      session_url: accepted ? body.claude_code_session_url || null : null,\n      error_summary: accepted ? null : 'Routine fire ' + status + '; HTTP ' + (code || 'network error'),\n    },\n    pairedItem: { item: index },\n  };\n});\n"
+      }
+    },
+    {
+      "id": "record-dispatch-result",
+      "name": "Record dispatch result",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1200,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE youleap_finops.slack_dispatch\nSET status = $2, session_id = $3, session_url = $4,\n    http_status = $5::integer, error_summary = $6, updated_at = now()\nWHERE event_key = $1 AND status = 'pending'\nRETURNING event_key, status, session_url;",
+        "options": {
+          "queryReplacement": "={{ [$json.event_key, $json.status, $json.session_id, $json.session_url, $json.http_status, $json.error_summary] }}"
+        }
+      }
+    },
+    {
+      "id": "check-accepted",
+      "name": "Check accepted",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const rows = $input.all();\nif (!rows.length || rows.some(item => item.json.status !== 'accepted')) {\n  throw new Error('Routine was not confirmed started. Review youleap_finops.slack_dispatch and Claude Runs before replaying.');\n}\nreturn rows;"
+      }
+    },
+    {
+      "id": "setup-notes",
+      "name": "Setup notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -30
+      ],
+      "parameters": {
+        "content": "## YouLeap FinOps → Claude Routine\n1. Read README-he.md and apply setup.sql.\n2. Select Slack API (token + signing secret), Postgres and HTTP Header Auth credentials.\n3. Enable API trigger in Claude; replace routine prompt with routine-prompt-he.md.\n4. Verify in a live test before removing the hourly schedule.\nThis workflow dispatches messages; Claude posts the answer via its Slack MCP.\nNo tokens are included in this export.",
+        "height": 250,
+        "width": 720
+      }
+    }
+  ],
+  "connections": {
+    "Slack message": {
+      "main": [
+        [
+          {
+            "node": "Filter human messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter human messages": {
+      "main": [
+        [
+          {
+            "node": "Claim message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim message": {
+      "main": [
+        [
+          {
+            "node": "Fire Claude routine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fire Claude routine": {
+      "main": [
+        [
+          {
+            "node": "Classify API response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify API response": {
+      "main": [
+        [
+          {
+            "node": "Record dispatch result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record dispatch result": {
+      "main": [
+        [
+          {
+            "node": "Check accepted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Jerusalem",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all",
+    "executionTimeout": 120
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
